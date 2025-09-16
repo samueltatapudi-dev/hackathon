@@ -101,7 +101,9 @@ def track_open():
     }
     append_event(event)
 
-    # Render an interstitial page with details and Proceed button
+    prefill_user = request.args.get("user") or request.args.get("username") or ""
+
+    # Render announcement details along with direct link to the task and an acknowledgement form
     html = """
     <!doctype html>
     <html>
@@ -111,10 +113,14 @@ def track_open():
         <title>Announcement</title>
         <style>
           body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
-          .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; max-width: 800px; }
-          .actions { margin-top: 1rem; }
+          .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.25rem; max-width: 800px; margin-bottom: 1.5rem; }
+          .actions { margin-top: 1.25rem; display: flex; flex-direction: column; gap: 0.5rem; }
+          .btn { display: inline-flex; align-items: center; justify-content: center; padding: 0.6rem 1.2rem; border-radius: 6px; background: #2e6bff; color: white; text-decoration: none; font-weight: 600; width: fit-content; }
+          .note { color: #555; font-size: 0.9rem; }
+          form { display: grid; gap: 0.5rem; max-width: 420px; }
+          input[type=text] { padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; }
           button { padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #2e6bff; color: white; cursor: pointer; }
-          a.btn { text-decoration: none; color: white; }
+          label { font-weight: 600; }
           .meta { color: #666; font-size: 0.9rem; }
         </style>
       </head>
@@ -123,13 +129,26 @@ def track_open():
           <h2>{{ title }}</h2>
           <p class="meta">Announcement ID: {{ announcement_id }}</p>
           <p>{{ details }}</p>
+          {% if target_url %}
           <div class="actions">
-            <form method="get" action="/proceed">
-              <input type="hidden" name="id" value="{{ announcement_id }}" />
-              <input type="hidden" name="target" value="{{ target }}" />
-              <button type="submit">Proceed to Task</button>
-            </form>
+            <a class="btn" href="{{ target_url }}" target="_blank" rel="noopener">Start Task</a>
+            <p class="note">The task opens in a new tab. Once you have completed it, return here to acknowledge.</p>
           </div>
+          {% else %}
+          <p class="meta">This announcement does not have a target URL configured.</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h3>Acknowledge Completion</h3>
+          <p class="meta">Record your acknowledgement after finishing the task.</p>
+          <form method="post" action="/acknowledge">
+            <label for="user">Username</label>
+            <input id="user" name="user" type="text" placeholder="employee@example.com" value="{{ default_user }}" required />
+            <input type="hidden" name="announcementId" value="{{ announcement_id }}" />
+            <input type="hidden" name="target" value="{{ target_url }}" />
+            <button type="submit">Acknowledge</button>
+          </form>
         </div>
       </body>
     </html>
@@ -140,53 +159,18 @@ def track_open():
         announcement_id=announcement_id,
         title=(ann["title"] if ann else "Announcement"),
         details=(ann["details"] if ann else "Please proceed to complete the task."),
-        target=target or (ann["target"] if ann else ""),
+        target_url=target or (ann["target"] if ann else ""),
+        default_user=prefill_user if prefill_user != "anonymous" else "",
     )
 
 
 @app.get("/proceed")
 def proceed():
-    ann_id = request.args.get("id", type=int)
-    target = request.args.get("target", default="")
-    ann = None
-    if ann_id is not None:
-        for a in announcements:
-            if a["id"] == ann_id:
-                ann = a
-                break
-
-    html = """
-    <!doctype html>
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Acknowledge</title>
-        <style>
-          body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 2rem; }
-          form { display: grid; gap: 0.5rem; max-width: 500px; }
-          input[type=text] { padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; }
-          button { padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #2e6bff; color: white; cursor: pointer; }
-          .meta { color: #666; font-size: 0.9rem; }
-        </style>
-      </head>
-      <body>
-        <h2>Acknowledgment</h2>
-        <p class="meta">Announcement ID: {{ announcement_id }}</p>
-        <form method="post" action="/acknowledge">
-          <label for="user">Username</label>
-          <input id="user" name="user" type="text" placeholder="employee@example.com" required />
-          <input type="hidden" name="announcementId" value="{{ announcement_id }}" />
-          <input type="hidden" name="target" value="{{ target }}" />
-          <button type="submit">Acknowledge</button>
-        </form>
-      </body>
-    </html>
-    """
-
-    return render_template_string(
-        html, announcement_id=ann_id, target=target or (ann["target"] if ann else "")
-    )
+    # Legacy route kept for compatibility; redirect to /track with the same parameters.
+    target_url = url_for("track_open")
+    if request.query_string:
+        target_url = f"{target_url}?{request.query_string.decode('utf-8')}"
+    return redirect(target_url)
 
 
 @app.post("/acknowledge")
