@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
+
+try:
+    from twilio.rest import Client  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    Client = None  # type: ignore
 
 
 app = Flask(__name__)
@@ -17,6 +22,7 @@ next_announcement_id: int = 1
 
 
 EVENTS_FILE = "events.json"
+SMS_RECIPIENTS_FILE = "sms_recipients.json"
 
 
 def iso_utc_now() -> str:
@@ -35,6 +41,116 @@ def append_event(event: Dict[str, Any]) -> None:
     line = json.dumps(event, ensure_ascii=False)
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def load_sms_recipients_from_file() -> List[str]:
+    if not os.path.exists(SMS_RECIPIENTS_FILE):
+        return []
+    try:
+        with open(SMS_RECIPIENTS_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError:
+        return []
+    if not content:
+        return []
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = None
+    numbers: List[str] = []
+    if isinstance(data, list):
+        numbers = [str(item).strip() for item in data if str(item).strip()]
+    elif isinstance(data, str):
+        numbers = [part.strip() for part in data.replace("\n", ",").split(",") if part.strip()]
+    else:
+        numbers = [part.strip() for part in content.replace("\n", ",").split(",") if part.strip()]
+    return _dedupe_preserve_order(numbers)
+
+
+def save_sms_recipients(raw_numbers: str) -> List[str]:
+    flattened = raw_numbers.replace("\n", ",")
+    numbers = _dedupe_preserve_order(flattened.split(","))
+    if numbers:
+        with open(SMS_RECIPIENTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(numbers, f)
+    else:
+        if os.path.exists(SMS_RECIPIENTS_FILE):
+            os.remove(SMS_RECIPIENTS_FILE)
+    return numbers
+
+
+def get_env_sms_recipients() -> List[str]:
+    env_value = os.environ.get("SMS_RECIPIENTS", "")
+    if not env_value:
+        return []
+    return _dedupe_preserve_order(env_value.replace("\n", ",").split(","))
+
+
+def get_sms_recipients() -> List[str]:
+    numbers = load_sms_recipients_from_file() + get_env_sms_recipients()
+    return _dedupe_preserve_order(numbers)
+
+
+def get_twilio_client() -> Optional[Client]:
+    if Client is None:
+        return None
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not account_sid or not auth_token:
+        return None
+    try:
+        return Client(account_sid, auth_token)
+    except Exception:
+        return None
+
+
+def send_sms_alert(event: Dict[str, Any], announcement: Optional[Dict[str, Any]]) -> None:
+    client = get_twilio_client()
+    if client is None:
+        return
+    from_number = os.environ.get("TWILIO_FROM_NUMBER")
+    if not from_number:
+        return
+    recipients = get_sms_recipients()
+    if not recipients:
+        return
+
+    title = announcement["title"] if announcement else "Announcement"
+    target = event.get("target") or (announcement["target"] if announcement else "")
+    event_type = event.get("event", "event").replace("_", " ").title()
+    timestamp = event.get("timestamp", iso_utc_now())
+    user = event.get("user", "") or "anonymous"
+    announcement_id = event.get("announcementId") or "N/A"
+
+    message_lines = [
+        f"{event_type}: {title}",
+        f"User: {user}",
+        f"Announcement ID: {announcement_id}",
+        f"Time: {timestamp}",
+    ]
+    if target:
+        message_lines.append(f"Target: {target}")
+    body = "\n".join(message_lines)
+
+    for number in recipients:
+        try:
+            client.messages.create(to=number, from_=from_number, body=body)
+        except Exception:
+            continue
 
 
 @app.post("/announcement")
@@ -100,6 +216,7 @@ def track_open():
         "ip": client_ip(),
     }
     append_event(event)
+    send_sms_alert(event, ann)
 
     prefill_user = request.args.get("user") or request.args.get("username") or ""
 
@@ -194,6 +311,13 @@ def acknowledge():
         "ip": client_ip(),
     }
     append_event(event)
+    ann = None
+    if announcement_id is not None:
+        for a in announcements:
+            if a["id"] == announcement_id:
+                ann = a
+                break
+    send_sms_alert(event, ann)
 
     html = """
     <!doctype html>
@@ -220,10 +344,27 @@ def acknowledge():
     return render_template_string(html)
 
 
-@app.get("/dashboard")
+@app.route("/dashboard", methods=["GET", "POST"])
 def dashboard():
     opened: List[Dict[str, Any]] = []
     acknowledged: List[Dict[str, Any]] = []
+    sms_status = ""
+    file_sms_numbers = load_sms_recipients_from_file()
+    sms_text_value = "\n".join(file_sms_numbers)
+    sms_env_numbers = get_env_sms_recipients()
+
+    if request.method == "POST":
+        form_name = request.form.get("form")
+        if form_name == "sms":
+            numbers = save_sms_recipients(request.form.get("sms_numbers", ""))
+            file_sms_numbers = numbers
+            sms_text_value = "\n".join(file_sms_numbers)
+            if numbers:
+                sms_status = f"Saved {len(numbers)} phone number(s)."
+            else:
+                sms_status = "SMS alerts disabled (no numbers saved)."
+        else:
+            sms_status = "Unrecognised form submission."
 
     if os.path.exists(EVENTS_FILE):
         with open(EVENTS_FILE, "r", encoding="utf-8") as f:
@@ -266,6 +407,21 @@ def dashboard():
       </head>
       <body>
         <h1>Events Dashboard</h1>
+
+        <div class="card">
+          <h2>SMS Alerts</h2>
+          <form method="post" class="row">
+            <input type="hidden" name="form" value="sms" />
+            <label for="sms_numbers">Phone numbers (one per line or comma separated)</label>
+            <textarea id="sms_numbers" name="sms_numbers" rows="3" placeholder="+15551234567">{{ sms_text_value }}</textarea>
+            <button type="submit">Save Numbers</button>
+            <span class="muted">{{ sms_status }}</span>
+          </form>
+          <p class="muted">Configure Twilio via environment variables: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER.</p>
+          {% if sms_env_numbers %}
+          <p class="muted">Additional numbers from SMS_RECIPIENTS env: {{ sms_env_numbers|join(', ') }}</p>
+          {% endif %}
+        </div>
 
         <div class="card">
           <h2>Create Announcement</h2>
@@ -392,7 +548,14 @@ def dashboard():
     </html>
     """
 
-    return render_template_string(html, opened=opened, acknowledged=acknowledged)
+    return render_template_string(
+        html,
+        opened=opened,
+        acknowledged=acknowledged,
+        sms_status=sms_status,
+        sms_text_value=sms_text_value,
+        sms_env_numbers=sms_env_numbers,
+    )
 
 
 @app.get("/")
