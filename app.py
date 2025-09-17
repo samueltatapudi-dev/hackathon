@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections import defaultdict, deque
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from statistics import mean
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 
@@ -11,6 +13,11 @@ try:
     from twilio.rest import Client  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
     Client = None  # type: ignore
+
+try:
+    from sklearn.cluster import KMeans  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    KMeans = None  # type: ignore
 
 
 app = Flask(__name__)
@@ -151,6 +158,260 @@ def send_sms_alert(event: Dict[str, Any], announcement: Optional[Dict[str, Any]]
             client.messages.create(to=number, from_=from_number, body=body)
         except Exception:
             continue
+
+
+def normalize_user(value: Optional[str]) -> str:
+    user = (value or "").strip()
+    return user or "anonymous"
+
+
+def parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def build_user_stats(events: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]]]:
+    user_stats: Dict[str, Dict[str, Any]] = {}
+    open_events: Dict[Tuple[Optional[str], str], deque] = defaultdict(deque)
+
+    for event in events:
+        event_type = event.get("event")
+        announcement_id = event.get("announcementId")
+        user = normalize_user(event.get("user"))
+        timestamp = parse_iso_timestamp(event.get("timestamp"))
+        target = event.get("target") or ""
+
+        stats = user_stats.setdefault(
+            user,
+            {
+                "open_count": 0,
+                "ack_count": 0,
+                "ack_delays": [],
+                "last_event_ts": None,
+                "targets": set(),
+            },
+        )
+
+        if timestamp and (stats["last_event_ts"] is None or timestamp > stats["last_event_ts"]):
+            stats["last_event_ts"] = timestamp
+        if target:
+            stats["targets"].add(target)
+
+        key = (announcement_id, user)
+
+        if event_type == "opened":
+            stats["open_count"] += 1
+            if timestamp is not None:
+                open_events[key].append(
+                    {
+                        "timestamp": timestamp,
+                        "target": target,
+                        "announcementId": announcement_id,
+                    }
+                )
+        elif event_type == "acknowledged":
+            stats["ack_count"] += 1
+            if timestamp is not None and open_events[key]:
+                opened_event = open_events[key].popleft()
+                opened_ts = opened_event.get("timestamp")
+                if opened_ts and timestamp >= opened_ts:
+                    delay_seconds = (timestamp - opened_ts).total_seconds()
+                    stats["ack_delays"].append(delay_seconds)
+
+    outstanding_by_user: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for (announcement_id, user), queue in open_events.items():
+        while queue:
+            opened_event = queue.popleft()
+            outstanding_by_user[user].append(
+                {
+                    "announcementId": announcement_id,
+                    "opened_at": opened_event.get("timestamp"),
+                    "target": opened_event.get("target"),
+                }
+            )
+
+    return user_stats, outstanding_by_user
+
+
+def calculate_engagement_score(stats: Dict[str, Any]) -> float:
+    opens = stats.get("open_count", 0)
+    acks = stats.get("ack_count", 0)
+    ack_rate = acks / opens if opens else 0.0
+    delays = stats.get("ack_delays", [])
+    avg_delay_hours = mean(delays) / 3600 if delays else 12.0
+    delay_score = max(0.0, min(1.0, 1 - (avg_delay_hours / 24)))
+    activity = min(opens + acks, 20) / 20
+    return round((0.6 * ack_rate) + (0.25 * delay_score) + (0.15 * activity), 4)
+
+
+def profile_users(user_stats: Dict[str, Any], outstanding: Dict[str, List[Dict[str, Any]]]) -> Tuple[Dict[str, Dict[str, Any]], str]:
+    profiles: Dict[str, Dict[str, Any]] = {}
+    features: List[List[float]] = []
+    ordered_users: List[str] = []
+
+    for user, stats in user_stats.items():
+        opens = stats.get("open_count", 0)
+        acks = stats.get("ack_count", 0)
+        ack_rate = acks / opens if opens else 0.0
+        delays = stats.get("ack_delays", [])
+        avg_delay_minutes = mean(delays) / 60 if delays else None
+        score = calculate_engagement_score(stats)
+        profiles[user] = {
+            "opens": opens,
+            "acks": acks,
+            "ack_rate": round(ack_rate * 100, 1),
+            "avg_delay_minutes": round(avg_delay_minutes, 1) if avg_delay_minutes is not None else None,
+            "score": score,
+            "classification": "",
+            "outstanding": len(outstanding.get(user, [])),
+        }
+
+        feature_vector = [
+            float(opens),
+            float(acks),
+            ack_rate,
+            (avg_delay_minutes / 60) if avg_delay_minutes is not None else 0.5,
+        ]
+        features.append(feature_vector)
+        ordered_users.append(user)
+
+    engine = "heuristic"
+    if KMeans is not None and len(features) >= 3:
+        try:
+            n_clusters = min(3, len(features))
+            model = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+            labels = model.fit_predict(features)
+            cluster_scores: Dict[int, float] = defaultdict(float)
+            cluster_counts: Dict[int, int] = defaultdict(int)
+            for idx, user in enumerate(ordered_users):
+                label = labels[idx]
+                cluster_scores[label] += profiles[user]["score"]
+                cluster_counts[label] += 1
+            averaged_scores = {
+                label: cluster_scores[label] / cluster_counts[label]
+                for label in cluster_scores
+                if cluster_counts[label]
+            }
+            # Higher score => more engaged
+            ordered_labels = sorted(averaged_scores, key=lambda lbl: averaged_scores[lbl], reverse=True)
+            segment_names = ["Highly Engaged", "Steady", "Needs Attention"]
+            mapping: Dict[int, str] = {}
+            for idx, label in enumerate(ordered_labels):
+                mapping[label] = segment_names[idx] if idx < len(segment_names) else segment_names[-1]
+            for idx, user in enumerate(ordered_users):
+                label = labels[idx]
+                profiles[user]["classification"] = mapping.get(label, "Steady")
+            engine = "sklearn-kmeans"
+        except Exception:
+            engine = "heuristic"
+
+    if engine == "heuristic":
+        for user, profile in profiles.items():
+            score = profile["score"]
+            ack_rate = profile["ack_rate"] / 100 if profile["ack_rate"] is not None else 0.0
+            if score >= 0.7 and ack_rate >= 0.65:
+                profile["classification"] = "Highly Engaged"
+            elif score >= 0.45:
+                profile["classification"] = "Steady"
+            else:
+                profile["classification"] = "Needs Attention"
+
+    return profiles, engine
+
+
+def generate_user_analytics(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    analytics = {
+        "overall": {
+            "total_events": len(events),
+            "total_users": 0,
+            "conversion_rate": 0.0,
+            "avg_ack_minutes": None,
+        },
+        "leaders": [],
+        "risks": [],
+        "insights": [],
+        "engine": "heuristic",
+    }
+
+    if not events:
+        analytics["insights"].append("No engagement events recorded yet. Ask users to open and acknowledge announcements to gather data.")
+        return analytics
+
+    user_stats, outstanding = build_user_stats(events)
+    profiles, engine = profile_users(user_stats, outstanding)
+    analytics["engine"] = engine
+
+    total_opens = sum(stats.get("open_count", 0) for stats in user_stats.values())
+    total_acks = sum(stats.get("ack_count", 0) for stats in user_stats.values())
+    conversion_rate = (total_acks / total_opens * 100) if total_opens else 0.0
+    all_delays = [delay for stats in user_stats.values() for delay in stats.get("ack_delays", [])]
+    avg_ack_minutes = mean(all_delays) / 60 if all_delays else None
+
+    analytics["overall"].update(
+        {
+            "total_users": len(user_stats),
+            "conversion_rate": round(conversion_rate, 1),
+            "avg_ack_minutes": round(avg_ack_minutes, 1) if avg_ack_minutes is not None else None,
+        }
+    )
+
+    outstanding_count = sum(len(items) for items in outstanding.values())
+    if outstanding_count:
+        analytics["insights"].append(
+            f"{outstanding_count} pending acknowledgement(s) across {len(outstanding)} user(s). Prioritise follow-up."
+        )
+
+    sorted_profiles = sorted(profiles.items(), key=lambda item: item[1]["score"], reverse=True)
+    for user, profile in sorted_profiles[:3]:
+        analytics["leaders"].append(
+            {
+                "user": user,
+                "score": profile["score"],
+                "classification": profile["classification"],
+                "ack_rate": profile["ack_rate"],
+                "avg_delay_minutes": profile["avg_delay_minutes"],
+            }
+        )
+
+    risk_candidates = []
+    for user, profile in profiles.items():
+        ack_rate = profile["ack_rate"] / 100 if profile["ack_rate"] is not None else 0.0
+        avg_delay_hours = (profile["avg_delay_minutes"] or 90) / 60
+        outstanding_tasks = profile["outstanding"]
+        if ack_rate < 0.6 or outstanding_tasks:
+            risk_score = (1 - ack_rate) + min(outstanding_tasks, 3) * 0.2 + min(avg_delay_hours / 12, 1)
+            risk_candidates.append(
+                {
+                    "user": user,
+                    "ack_rate": round(ack_rate * 100, 1),
+                    "outstanding": outstanding_tasks,
+                    "avg_delay_minutes": profile["avg_delay_minutes"],
+                    "classification": profile["classification"],
+                    "risk_score": round(risk_score, 3),
+                }
+            )
+
+    risk_candidates.sort(key=lambda item: item["risk_score"], reverse=True)
+    analytics["risks"] = risk_candidates[:3]
+
+    if analytics["overall"]["conversion_rate"] < 60:
+        analytics["insights"].append("Overall conversion rate is under 60%. Consider reinforcing acknowledgements in upcoming communications.")
+
+    if analytics["overall"]["avg_ack_minutes"] and analytics["overall"]["avg_ack_minutes"] > 180:
+        analytics["insights"].append(
+            "Average acknowledgement time exceeds 3 hours. Send reminders or shorten tasks to encourage quicker responses."
+        )
+
+    if not analytics["insights"]:
+        analytics["insights"].append("Engagement metrics look healthy. Continue monitoring for trends.")
+
+    return analytics
 
 
 @app.post("/announcement")
@@ -352,6 +613,7 @@ def dashboard():
     file_sms_numbers = load_sms_recipients_from_file()
     sms_text_value = "\n".join(file_sms_numbers)
     sms_env_numbers = get_env_sms_recipients()
+    events: List[Dict[str, Any]] = []
 
     if request.method == "POST":
         form_name = request.form.get("form")
@@ -376,10 +638,13 @@ def dashboard():
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                events.append(rec)
                 if rec.get("event") == "opened":
                     opened.append(rec)
                 elif rec.get("event") == "acknowledged":
                     acknowledged.append(rec)
+
+    ai_insights = generate_user_analytics(events)
 
     # Simple table renderer
     html = """
@@ -420,6 +685,45 @@ def dashboard():
           <p class="muted">Configure Twilio via environment variables: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER.</p>
           {% if sms_env_numbers %}
           <p class="muted">Additional numbers from SMS_RECIPIENTS env: {{ sms_env_numbers|join(', ') }}</p>
+          {% endif %}
+        </div>
+
+        <div class="card">
+          <h2>AI Insights</h2>
+          {% if ai_insights.overall.total_events %}
+          <p class="muted">Engine: {{ ai_insights.engine }} · Users: {{ ai_insights.overall.total_users }} · Conversion: {{ ai_insights.overall.conversion_rate }}%
+            {% if ai_insights.overall.avg_ack_minutes is not none %}· Avg ack delay: {{ ai_insights.overall.avg_ack_minutes }} min{% endif %}
+          </p>
+          {% if ai_insights.leaders %}
+          <h3>Top Contributors</h3>
+          <ul>
+            {% for item in ai_insights.leaders %}
+            <li><strong>{{ item.user }}</strong> — {{ item.classification }} · Score {{ '%.2f'|format(item.score) }} · Ack rate {{ item.ack_rate }}%
+              {% if item.avg_delay_minutes is not none %} · Avg delay {{ item.avg_delay_minutes }} min{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          {% if ai_insights.risks %}
+          <h3>At-Risk Users</h3>
+          <ul>
+            {% for item in ai_insights.risks %}
+            <li><strong>{{ item.user }}</strong> — {{ item.classification }} · Ack rate {{ item.ack_rate }}% · Outstanding {{ item.outstanding }} · Risk score {{ '%.2f'|format(item.risk_score) }}
+              {% if item.avg_delay_minutes is not none %} · Avg delay {{ item.avg_delay_minutes }} min{% endif %}
+            </li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          {% if ai_insights.insights %}
+          <h3>Highlights</h3>
+          <ul>
+            {% for message in ai_insights.insights %}
+            <li>{{ message }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+          {% else %}
+          <p class="muted">Not enough engagement data yet. Insights appear after users interact with announcements.</p>
           {% endif %}
         </div>
 
@@ -555,6 +859,7 @@ def dashboard():
         sms_status=sms_status,
         sms_text_value=sms_text_value,
         sms_env_numbers=sms_env_numbers,
+        ai_insights=ai_insights,
     )
 
 
